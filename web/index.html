@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cemu Web</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f7f7f8; --fg:#1d1d1f; --muted:#6b6b70; --panel:#ffffff; --line:#d9d9de; --accent:#2f6fde; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141416; --fg:#ececef; --muted:#9a9aa2; --panel:#1d1d21; --line:#33333a; --accent:#6c9cf0; } }
+  body { margin:0; font:15px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 20px; color: var(--muted); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+  label.btn, button { display:inline-block; padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--fg); cursor:pointer; font:inherit; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  input[type=file] { display:none; }
+  select { font: inherit; padding: 6px; max-width: 100%; }
+  #status { color: var(--muted); }
+  pre { background: #0c0c0e; color: #d7d7db; border-radius: 10px; padding: 12px; height: 420px; overflow: auto; font: 12px/1.45 ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; margin: 0; }
+  .warn { color: #c0392b; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Cemu Web</h1>
+  <p class="sub">Wii U 에뮬레이터 Cemu의 WebAssembly 실험 빌드. 아직 화면 출력은 없고, CPU·OS 에뮬레이션과 로그만 동작합니다.
+     선택한 파일은 업로드되지 않고 브라우저 안에서만 읽힙니다.</p>
+
+  <div class="panel">
+    <div class="row">
+      <label class="btn">게임 폴더 열기 (code/content/meta)<input id="dir" type="file" webkitdirectory multiple></label>
+      <label class="btn">파일 열기 (.rpx / .wua / .wud / .wux)<input id="file" type="file" accept=".rpx,.elf,.wua,.wud,.wux,.wuhb"></label>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <select id="entry" hidden></select>
+      <button id="start" class="primary" disabled>실행</button>
+      <span id="status">게임을 선택하세요.</span>
+    </div>
+    <p id="coi" class="warn" hidden>이 페이지는 cross-origin isolation(COOP/COEP 헤더)이 필요합니다. <code>python3 scripts/serve-web.py</code>로 열어 주세요.</p>
+  </div>
+
+  <pre id="log"></pre>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let selection = null; // {files:[{path,file}], entries:[path]}
+
+if (!self.crossOriginIsolated) $('coi').hidden = false;
+
+function choose(list, useRelative) {
+  const files = [...list].map((f) => ({ path: useRelative && f.webkitRelativePath ? f.webkitRelativePath : f.name, file: f }));
+  // launchable entries: a title folder (…/code/*.rpx) or a single image file
+  const entries = files.map((f) => f.path).filter((p) => /\.(rpx|elf|wua|wud|wux|wuhb)$/i.test(p));
+  // for a title folder Cemu wants the folder that holds code/ (or the rpx itself)
+  const sel = $('entry');
+  sel.innerHTML = '';
+  for (const p of entries) { const o = document.createElement('option'); o.value = o.textContent = p; sel.appendChild(o); }
+  sel.hidden = entries.length <= 1;
+  selection = { files };
+  $('start').disabled = entries.length === 0;
+  $('status').textContent = entries.length ? `${files.length}개 파일, 실행 파일 ${entries.length}개` : '실행할 수 있는 파일(.rpx/.wua/.wud/.wux)이 없습니다.';
+}
+$('dir').onchange = (e) => choose(e.target.files, true);
+$('file').onchange = (e) => choose(e.target.files, false);
+
+function log(text, cls) {
+  const el = $('log');
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = text;
+  el.appendChild(line);
+  if (el.childNodes.length > 5000) el.removeChild(el.firstChild);
+  el.scrollTop = el.scrollHeight;
+}
+
+$('start').onclick = () => {
+  $('start').disabled = true;
+  const params = new URLSearchParams(location.search);
+  const worker = new Worker('cemu-worker.js');
+  worker.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === 'log') log(m.text);
+    else if (m.type === 'error') log(m.text, 'warn');
+    else if (m.type === 'exit') { log(`[web] exited with code ${m.code}`); $('status').textContent = '종료됨'; }
+  };
+  worker.onerror = (e) => log('worker error: ' + e.message, 'warn');
+  const entry = $('entry').value;
+  $('status').textContent = '실행 중…';
+  worker.postMessage({ type: 'start', files: selection.files, entry,
+    args: params.has('jit') ? [] : ['--force-interpreter'],
+    runSeconds: Number(params.get('seconds')) || 0 });
+};
+</script>
+</body>
+</html>

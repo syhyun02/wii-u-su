@@ -15,7 +15,10 @@ target_link_options(cemu-headless PRIVATE
 if(CEMU_WASM_TARGET STREQUAL "node")
 	target_link_options(cemu-headless PRIVATE -sENVIRONMENT=node -sNODERAWFS=1)
 else()
+	# runs inside a dedicated Worker (web/cemu-worker.js); the user's game is mounted with WORKERFS (read in place, never copied)
 	target_link_options(cemu-headless PRIVATE -sENVIRONMENT=web,worker -sFORCE_FILESYSTEM=1 -lworkerfs.js -lidbfs.js
-		-sMODULARIZE=1 -sEXPORT_NAME=createCemu -sEXPORTED_RUNTIME_METHODS=FS,callMain)
+		-sMODULARIZE=1 -sEXPORT_NAME=createCemu -sINVOKE_RUN=0 -sINCOMING_MODULE_JS_API=print,printErr,locateFile,onExit,onAbort,mainScriptUrlOrBlob,preRun,postRun,arguments -sEXPORTED_RUNTIME_METHODS=FS,ENV,callMain,WORKERFS,IDBFS
+		"SHELL:--preload-file ${CMAKE_SOURCE_DIR}/bin/gameProfiles@/cemu-data/gameProfiles"
+		"SHELL:--preload-file ${CMAKE_SOURCE_DIR}/bin/resources/sharedFonts@/cemu-data/resources/sharedFonts")
 	set_target_properties(cemu-headless PROPERTIES OUTPUT_NAME cemu-web)
 endif()

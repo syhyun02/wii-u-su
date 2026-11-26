@@ -28,3 +28,5 @@ emsdk/
 *.wasm
 node_modules/
 build-wasm-deps
+web/cemu-web.js
+web/cemu-web.data

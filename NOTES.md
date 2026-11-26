@@ -8,7 +8,8 @@
 |---|---|
 | 1단계: 분석과 계획 | ✅ 완료 (2026-11-26) |
 | P1 네이티브 헤드리스 | ✅ 테스트 홈브루 부팅, 결과값이 호스트 기준값과 일치 (`scripts/build-native.sh`) |
-| P2 wasm 헤드리스 | ✅ Node에서 테스트 홈브루가 끝까지 실행·정상 종료, 출력이 네이티브와 일치 (`scripts/build-wasm.sh`). 다음: 브라우저 페이지 |
+| P2 wasm 헤드리스 | ✅ Node와 **브라우저(Chromium)** 에서 테스트 홈브루가 끝까지 실행, 출력이 네이티브와 일치 |
+| P3 웹 프런트엔드 | 🚧 `web/index.html`: 폴더/파일 선택(업로드 없음, WORKERFS), Worker에서 실행, IDBFS에 설정·세이브, 로그 표시. 화면 출력 없음 |
 | 원본 Cemu | `upstream/Cemu` git 서브모듈, upstream `2f49c079` (2026-11-20)에 고정 |
 | Cemu 코드 수정 | `patches/cemu/0001-0006` (적용: `scripts/apply-patches.sh`) |
 
@@ -443,6 +444,16 @@ Wii U(3코어 1.24GHz + R700급 GPU)는 3DS보다 요구 성능이 훨씬 크므
 - **결과**: Node에서 `hello.rpx`가 끝까지 실행, 결정적 출력 5줄이 네이티브와 동일, `title exited with status 0`으로 정상 종료.
 - 속도(같은 머신, 인터프리터): 정수 루프 네이티브 128ms → wasm 420ms, 부동소수점 4.6s → 15.0s. 약 **3.3배 느림**.
   gaemboy의 FastInterp(손실 25~33%)보다 손실이 크다. Cemu 인터프리터의 디스패치 구조 때문으로 보이며, 어차피 JIT(P5)이 필요하다.
+
+### 2026-11-26 — 브라우저에서 첫 실행
+
+- `WASM_TARGET=web scripts/build-wasm.sh` → `scripts/package-web.sh` → `scripts/serve-web.py` (COOP/COEP 헤더) → http://localhost:8080/
+- 구조: 페이지 → `web/cemu-worker.js`(Worker) 안에서 모듈 실행 → pthread 작업자들은 그 Worker가 띄움(중첩 Worker).
+  게임은 `WORKERFS`로 마운트(파일을 복사하지 않고 필요할 때 조각 단위로 읽음), `/cemu`는 IDBFS(설정·mlc01·세이브, 10초마다 동기화).
+  `gameProfiles`와 오픈 소스 대체 폰트(`resources/sharedFonts`)는 `cemu-web.data`(27MB)로 함께 배포.
+- 함정: Worker 안에서 MODULARIZE 모듈을 띄우면 pthread 작업자가 Worker 스크립트 자체를 로드하려 한다 → `mainScriptUrlOrBlob` 지정
+  (그리고 `INCOMING_MODULE_JS_API`에 추가해야 함).
+- 확인: `tests/web/run-page.js`로 헤드리스 Chromium에서 페이지를 열고 파일 선택 → 실행 → 로그 확인. 출력이 네이티브와 동일.
 
 ### 참고 링크
 

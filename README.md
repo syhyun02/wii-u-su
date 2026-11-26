@@ -7,3 +7,14 @@ Wii U 에뮬레이터 [Cemu](https://github.com/cemu-project/Cemu)를 WebAssembl
 - Cemu 변경 사항: [patches/cemu/](patches/cemu/)
 
 게임 이미지, 키(`keys.txt`), 콘솔 덤프(`otp.bin`, `seeprom.bin`, `mlc01`)는 포함하지 않으며 저장소에 넣지 않는다.
+
+## 지금 해볼 수 있는 것 (화면 출력 없음, 로그만)
+
+```bash
+scripts/apply-patches.sh
+source ~/emsdk/emsdk_env.sh
+scripts/build-deps-wasm.sh
+WASM_TARGET=web BUILD=build-wasm-web scripts/build-wasm.sh
+scripts/package-web.sh
+scripts/serve-web.py 8080   # http://localhost:8080/ (Chrome/Edge 권장)
+```
