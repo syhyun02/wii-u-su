@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.7)
+project(hello C)
+add_executable(hello main.c)
+target_link_libraries(hello m)
+wut_create_rpx(hello)

@@ -1,0 +1,68 @@
+From cbe3e30b18a292dc2b002e691fbfe435b2a14871 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 26 Nov 2026 08:24:22 +0000
+Subject: [PATCH 1/2] CMake: allow an external frontend instead of the
+ wxWidgets executable
+
+CEMU_FRONTEND_DIR builds a frontend project from outside the tree in place of
+CemuBin. X11/GTK3 are only required when wxWidgets is enabled.
+---
+ CMakeLists.txt            | 3 ++-
+ src/CMakeLists.txt        | 6 ++++++
+ src/Common/CMakeLists.txt | 2 +-
+ 3 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9cf7a272..37f5be93 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -148,6 +148,7 @@ endif()
+ option(ENABLE_CUBEB "Enabled cubeb backend" ON)
+ 
+ option(ENABLE_WXWIDGETS "Build with wxWidgets UI (Currently required)" ON)
++set(CEMU_FRONTEND_DIR "" CACHE PATH "Build an external frontend (CMake project dir) instead of the wxWidgets CemuBin executable")
+ 
+ find_package(Threads REQUIRED)
+ find_package(CURL REQUIRED)
+@@ -173,7 +174,7 @@ if (NOT TARGET glslang::SPIRV AND TARGET SPIRV)
+ 	add_library(glslang::SPIRV ALIAS SPIRV)
+ endif()
+ 
+-if (UNIX AND NOT APPLE)
++if (UNIX AND NOT APPLE AND ENABLE_WXWIDGETS)
+ 	find_package(X11 REQUIRED)
+ 	if (ENABLE_WAYLAND)
+ 		find_package(Wayland REQUIRED Client)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 936d19d6..381dd1bf 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -66,6 +66,12 @@ add_subdirectory(util)
+ add_subdirectory(imgui)
+ add_subdirectory(resource)
+ 
++if(CEMU_FRONTEND_DIR)
++	# external frontend (e.g. headless / web) replaces the wxWidgets executable
++	add_subdirectory(${CEMU_FRONTEND_DIR} ${CMAKE_BINARY_DIR}/frontend)
++	return()
++endif()
++
+ add_executable(CemuBin
+ 	main.cpp
+ 	mainLLE.cpp
+diff --git a/src/Common/CMakeLists.txt b/src/Common/CMakeLists.txt
+index d3ffb711..409106df 100644
+--- a/src/Common/CMakeLists.txt
++++ b/src/Common/CMakeLists.txt
+@@ -63,7 +63,7 @@ target_link_libraries(CemuCommon PRIVATE
+ 	glm::glm
+ )
+ 
+-if (UNIX AND NOT APPLE)
++if (UNIX AND NOT APPLE AND ENABLE_WXWIDGETS)
+ 	target_link_libraries(CemuCommon PRIVATE X11::X11 X11::Xrender X11::Xutil)
+ endif()
+ 
+-- 
+2.43.0
+
