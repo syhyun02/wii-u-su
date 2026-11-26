@@ -1,0 +1,29 @@
+# === 절대 커밋 금지: 게임 데이터, 키, 콘솔 덤프 ===
+*.wud
+*.wux
+*.wua
+*.wuhb
+*.rpx
+*.rpl
+*.elf
+*.iso
+*.app
+*.h3
+*.tik
+*.tmd
+*.cert
+keys.txt
+otp.bin
+seeprom.bin
+mlc01/
+slc/
+games/
+roms/
+run/
+
+# === 빌드 산출물 ===
+build*/
+dist/
+emsdk/
+*.wasm
+node_modules/
