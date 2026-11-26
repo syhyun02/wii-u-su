@@ -1,0 +1,3 @@
+[submodule "upstream/Cemu"]
+	path = upstream/Cemu
+	url = https://github.com/cemu-project/Cemu.git
