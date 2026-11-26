@@ -1,0 +1,573 @@
+From 3b966a2ff929cd40b76a2efcae20e70ee899c21f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 26 Nov 2026 08:56:40 +0000
+Subject: [PATCH 5/5] Build the core with Emscripten (wasm32)
+
+- CMake: glslang only with Vulkan/OpenGL, allow 32-bit pointers on Emscripten,
+  ZArchive needs <cstdlib>, ExceptionHandler stub, fontawesome via #embed
+- ih264d: generic (non-SIMD) function selector and platform macros
+- platform code: byteswap, clocks, _strcmpi/_BitScanReverse fallbacks,
+  portable versions of _mm_pause/__rdtsc/_mm_mfence/_addcarry_u64
+- flat_hash_map prime table uses 64-bit values even with 32-bit size_t
+- no DSU (UDP) controller client, no thread names, platform name in log
+---
+ CMakeLists.txt                                |   7 +-
+ dependencies/ih264d/CMakeLists.txt            |   3 +
+ .../common/generic/ih264_platform_macros.h    | 146 ++++++++++++++++++
+ .../generic/ih264d_function_selector.c        |  27 ++++
+ src/CMakeLists.txt                            |   2 +-
+ src/Cafe/CMakeLists.txt                       |   4 +-
+ src/Cafe/CafeSystem.cpp                       |   2 +
+ .../Latte/LatteAddrLib/LatteAddrLib_Coord.cpp |   2 +-
+ src/Cafe/IOSU/PDM/iosu_pdm.cpp                |   2 +-
+ src/Cafe/OS/libs/coreinit/coreinit_MCP.cpp    |   2 +-
+ src/Cafe/OS/libs/nsysnet/nsysnet.h            |   1 +
+ src/Common/CMakeLists.txt                     |   6 +-
+ .../ExceptionHandler_emscripten.cpp           |   6 +
+ src/Common/platform.h                         |   3 +
+ src/Common/precompiled.h                      |  34 +++-
+ src/Common/unix/platform.cpp                  |   2 +-
+ src/input/api/DSU/DSUControllerProvider.h     |   4 +
+ src/resource/CMakeLists.txt                   |   5 +-
+ src/resource/embedded/fontawesome_embed.c     |   6 +
+ src/util/containers/flat_hash_map.hpp         |   6 +-
+ src/util/helpers/helpers.cpp                  |   2 +
+ .../HighResolutionTimer.cpp                   |   4 +-
+ 22 files changed, 261 insertions(+), 15 deletions(-)
+ create mode 100644 dependencies/ih264d/common/generic/ih264_platform_macros.h
+ create mode 100644 dependencies/ih264d/decoder/generic/ih264d_function_selector.c
+ create mode 100644 src/Common/ExceptionHandler/ExceptionHandler_emscripten.cpp
+ create mode 100644 src/resource/embedded/fontawesome_embed.c
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 37f5be93..b0edfbf5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -156,7 +156,9 @@ find_package(pugixml REQUIRED)
+ find_package(RapidJSON REQUIRED)
+ find_package(Boost COMPONENTS program_options filesystem nowide REQUIRED)
+ find_package(libzip REQUIRED)
+-find_package(glslang REQUIRED)
++if (ENABLE_VULKAN OR ENABLE_OPENGL)
++	find_package(glslang REQUIRED)
++endif()
+ find_package(ZLIB REQUIRED)
+ find_package(zstd MODULE REQUIRED) # MODULE so that zstd::zstd is available
+ find_package(OpenSSL COMPONENTS Crypto SSL REQUIRED)
+@@ -271,6 +273,9 @@ endif()
+ find_package(ZArchive QUIET)
+ if (NOT ZArchive_FOUND)
+ 	add_subdirectory("dependencies/ZArchive" EXCLUDE_FROM_ALL)
++	if (EMSCRIPTEN)
++		target_compile_options(zarchive PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-include cstdlib>)
++	endif()
+ endif()
+ 
+ add_subdirectory(src)
+diff --git a/dependencies/ih264d/CMakeLists.txt b/dependencies/ih264d/CMakeLists.txt
+index a8ef3776..32b35d06 100644
+--- a/dependencies/ih264d/CMakeLists.txt
++++ b/dependencies/ih264d/CMakeLists.txt
+@@ -189,6 +189,9 @@ endif()
+ if(APPLE)
+     target_sources(ih264d PRIVATE "common/armv8/macos_arm_symbol_aliases.s")
+ endif()
++elseif(EMSCRIPTEN)
++include_directories("common/" "decoder/" "common/generic")
++target_sources(ih264d PRIVATE "decoder/generic/ih264d_function_selector.c")
+ else()
+ message(FATAL_ERROR "ih264d unknown architecture: ${IH264D_ARCHITECTURE}")
+ endif()
+diff --git a/dependencies/ih264d/common/generic/ih264_platform_macros.h b/dependencies/ih264d/common/generic/ih264_platform_macros.h
+new file mode 100644
+index 00000000..fe698748
+--- /dev/null
++++ b/dependencies/ih264d/common/generic/ih264_platform_macros.h
+@@ -0,0 +1,146 @@
++/******************************************************************************
++ *
++ * Copyright (C) 2015 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ *****************************************************************************
++ * Originally developed and contributed by Ittiam Systems Pvt. Ltd, Bangalore
++*/
++/**
++*******************************************************************************
++* @file
++*  ih264_platform_macros.h
++*
++* @brief
++*  Platform specific Macro definitions used in the codec
++*
++* @author
++*  Ittiam
++*
++* @remarks
++*  None
++*
++*******************************************************************************
++*/
++
++
++#ifndef _IH264_PLATFORM_MACROS_H_
++#define _IH264_PLATFORM_MACROS_H_
++
++#include <stdint.h>
++
++#if defined(_MSC_VER) && defined(__clang__)
++#include <intrin.h>
++#endif
++
++#define CLIP_U8(x) CLIP3(0, UINT8_MAX, (x))
++#define CLIP_S8(x) CLIP3(INT8_MIN, INT8_MAX, (x))
++
++#define CLIP_U10(x) CLIP3(0, 1023, (x))
++#define CLIP_S10(x) CLIP3(-512, 511, (x))
++
++#define CLIP_U11(x) CLIP3(0, 2047, (x))
++#define CLIP_S11(x) CLIP3(-1024, 1023, (x))
++
++#define CLIP_U12(x) CLIP3(0, 4095, (x))
++#define CLIP_S12(x) CLIP3(-2048, 2047, (x))
++
++#define CLIP_U16(x) CLIP3(0, UINT16_MAX, (x))
++#define CLIP_S16(x) CLIP3(INT16_MIN, INT16_MAX, (x))
++
++#define CLIP_U32(x) CLIP3(0, UINT32_MAX, (x))
++#define CLIP_S32(x) CLIP3(INT32_MIN, INT32_MAX, (x))
++
++#define MEM_ALIGN16 __attribute__ ((aligned (16)))
++
++#define SHL(x,y) (((y) < 32) ? ((x) << (y)) : 0)
++#define SHR(x,y) (((y) < 32) ? ((x) >> (y)) : 0)
++
++#define SHR_NEG(val,shift)  ((shift>0)?(val>>shift):(val<<(-shift)))
++#define SHL_NEG(val,shift)  ((shift<0)?(val>>(-shift)):(val<<shift))
++
++#define PLD(a)
++
++/* For MSVC x64 */
++
++#if defined(_MSC_VER) && !defined(__clang__)
++
++static inline int __builtin_clz(unsigned x)
++{
++	unsigned long n;
++	_BitScanReverse(&n, x);
++	return n ^ 31;
++}
++
++static inline int __builtin_ctz(unsigned x) {
++	unsigned long ret;
++	_BitScanForward(&ret, x);
++	return (int)ret;
++}
++
++static inline void __sync_synchronize() {
++	__faststorefence();
++}
++
++#define NOP(nop_cnt) {UWORD32 nop_i; for (nop_i = 0; nop_i < nop_cnt; nop_i++) __nop();}
++
++#else
++
++#define NOP(nop_cnt) {UWORD32 nop_i; for (nop_i = 0; nop_i < nop_cnt; nop_i++) __asm__ volatile("");}
++
++#endif
++
++/* In normal cases, 0 will not be passed as an argument to CLZ and CTZ.
++As CLZ and CTZ outputs are used as a shift value in few places, these return
++31 for u4_word == 0 case, just to handle error cases gracefully without any
++undefined behaviour */
++
++static __inline UWORD32 CLZ(UWORD32 u4_word)
++{
++    if(u4_word || 1)
++        return(__builtin_clz(u4_word));
++    else
++        return 31;
++}
++
++static __inline UWORD32 CTZ(UWORD32 u4_word)
++{
++    if(0 == u4_word && 0)
++        return 31;
++    else
++    {
++        unsigned int index;
++        index = __builtin_ctz(u4_word);
++        return (UWORD32)index;
++    }
++}
++
++#define DATA_SYNC()  __sync_synchronize()
++
++//#define INLINE __inline
++#define INLINE inline
++
++#define PREFETCH_ENABLE 0
++
++#if PREFETCH_ENABLE
++#define PREFETCH(ptr, type) _mm_prefetch(ptr, type);
++#else
++#define PREFETCH(ptr, type)
++#endif
++
++#define MEM_ALIGN8 __attribute__ ((aligned (8)))
++#define MEM_ALIGN16 __attribute__ ((aligned (16)))
++#define MEM_ALIGN32 __attribute__ ((aligned (32)))
++
++#endif /* _IH264_PLATFORM_MACROS_H_ */
+diff --git a/dependencies/ih264d/decoder/generic/ih264d_function_selector.c b/dependencies/ih264d/decoder/generic/ih264d_function_selector.c
+new file mode 100644
+index 00000000..81994064
+--- /dev/null
++++ b/dependencies/ih264d/decoder/generic/ih264d_function_selector.c
+@@ -0,0 +1,27 @@
++/* Function selector for targets without SIMD-specific code paths (e.g. WebAssembly). */
++#include <stdio.h>
++#include <stddef.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "ih264_typedefs.h"
++#include "iv.h"
++#include "ivd.h"
++#include "ih264_defs.h"
++#include "ih264_size_defs.h"
++#include "ih264_error.h"
++#include "ih264_trans_quant_itrans_iquant.h"
++#include "ih264_inter_pred_filters.h"
++
++#include "ih264d_structs.h"
++#include "ih264d_function_selector.h"
++
++void ih264d_init_function_ptr(dec_struct_t *ps_codec)
++{
++    ih264d_init_function_ptr_generic(ps_codec);
++}
++
++void ih264d_init_arch(dec_struct_t *ps_codec)
++{
++    ps_codec->e_processor_arch = ARCH_NA;
++}
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 381dd1bf..f3f92d55 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -6,7 +6,7 @@ if(CEMU_CXX_FLAGS)
+ 	add_compile_options(${CEMU_CXX_FLAGS})
+ endif()
+ 
+-if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
++if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT EMSCRIPTEN)
+ 	message( FATAL_ERROR "Pointers are not 64bit" )
+ endif()
+ 
+diff --git a/src/Cafe/CMakeLists.txt b/src/Cafe/CMakeLists.txt
+index 7240c565..4886e008 100644
+--- a/src/Cafe/CMakeLists.txt
++++ b/src/Cafe/CMakeLists.txt
+@@ -638,7 +638,9 @@ endif()
+ 
+ target_include_directories(CemuCafe PUBLIC "../")
+ 
+-if (glslang_VERSION VERSION_LESS "15.0.0")
++if (NOT glslang_FOUND)
++	set(glslang_target "")
++elseif (glslang_VERSION VERSION_LESS "15.0.0")
+ 	set(glslang_target "glslang::SPIRV")
+ else()
+ 	set(glslang_target "glslang::glslang")
+diff --git a/src/Cafe/CafeSystem.cpp b/src/Cafe/CafeSystem.cpp
+index 8318ceda..b7d12d53 100644
+--- a/src/Cafe/CafeSystem.cpp
++++ b/src/Cafe/CafeSystem.cpp
+@@ -563,6 +563,8 @@ namespace CafeSystem
+ 		}
+ 		else
+ 			platform = "Linux";
++		#elif defined(__EMSCRIPTEN__)
++		platform = "WebAssembly";
+ 		#elif BOOST_OS_MACOS
+ 		char productVersion[256]{};
+ 		size_t productVersionSize = sizeof(productVersion);
+diff --git a/src/Cafe/HW/Latte/LatteAddrLib/LatteAddrLib_Coord.cpp b/src/Cafe/HW/Latte/LatteAddrLib/LatteAddrLib_Coord.cpp
+index 26da5ec1..830a74c1 100644
+--- a/src/Cafe/HW/Latte/LatteAddrLib/LatteAddrLib_Coord.cpp
++++ b/src/Cafe/HW/Latte/LatteAddrLib/LatteAddrLib_Coord.cpp
+@@ -7,7 +7,7 @@ using namespace Latte;
+ namespace LatteAddrLib
+ {
+ 
+-#if BOOST_OS_LINUX || BOOST_OS_MACOS || BOOST_OS_BSD
++#if BOOST_OS_LINUX || BOOST_OS_MACOS || BOOST_OS_BSD || defined(__EMSCRIPTEN__)
+ 	unsigned char _BitScanReverse(uint32* _Index, uint32 _Mask)
+ 	{
+ 		if (!_Mask)
+diff --git a/src/Cafe/IOSU/PDM/iosu_pdm.cpp b/src/Cafe/IOSU/PDM/iosu_pdm.cpp
+index b9dda445..1ae99750 100644
+--- a/src/Cafe/IOSU/PDM/iosu_pdm.cpp
++++ b/src/Cafe/IOSU/PDM/iosu_pdm.cpp
+@@ -5,7 +5,7 @@
+ #include "Common/FileStream.h"
+ #include "util/helpers/Semaphore.h"
+ 
+-#if BOOST_OS_LINUX
++#if BOOST_OS_LINUX || defined(__EMSCRIPTEN__)
+ // using chrono::year_month_date and other features require a relatively recent stdlibc++
+ // to avoid upping the required version we use the STL reference implementation for now
+ #include "Common/unix/date.h"
+diff --git a/src/Cafe/OS/libs/coreinit/coreinit_MCP.cpp b/src/Cafe/OS/libs/coreinit/coreinit_MCP.cpp
+index afbe0bfa..ae640532 100644
+--- a/src/Cafe/OS/libs/coreinit/coreinit_MCP.cpp
++++ b/src/Cafe/OS/libs/coreinit/coreinit_MCP.cpp
+@@ -476,7 +476,7 @@ typedef struct
+ 
+ static_assert(sizeof(UCParamStruct_t) == 0x54); // unsure
+ 
+-#if BOOST_OS_LINUX || BOOST_OS_MACOS || BOOST_OS_BSD
++#if BOOST_OS_LINUX || BOOST_OS_MACOS || BOOST_OS_BSD || defined(__EMSCRIPTEN__)
+ #define _strcmpi strcasecmp
+ #endif
+ 
+diff --git a/src/Cafe/OS/libs/nsysnet/nsysnet.h b/src/Cafe/OS/libs/nsysnet/nsysnet.h
+index c38ea6c9..9a508160 100644
+--- a/src/Cafe/OS/libs/nsysnet/nsysnet.h
++++ b/src/Cafe/OS/libs/nsysnet/nsysnet.h
+@@ -7,6 +7,7 @@
+ #include <WinSock2.h>
+ #else
+ #include <sys/socket.h>
++#include <sys/select.h>
+ #define SOCKET int
+ #define closesocket close
+ #endif
+diff --git a/src/Common/CMakeLists.txt b/src/Common/CMakeLists.txt
+index 409106df..64eb8581 100644
+--- a/src/Common/CMakeLists.txt
++++ b/src/Common/CMakeLists.txt
+@@ -44,8 +44,12 @@ PRIVATE
+     unix/platform.h
+     unix/FileStream_unix.cpp
+     unix/FileStream_unix.h
+-    ExceptionHandler/ExceptionHandler_posix.cpp
+ )
++if(EMSCRIPTEN)
++	target_sources(CemuCommon PRIVATE ExceptionHandler/ExceptionHandler_emscripten.cpp)
++else()
++	target_sources(CemuCommon PRIVATE ExceptionHandler/ExceptionHandler_posix.cpp)
++endif()
+ endif()
+ 
+ if(LINUX)
+diff --git a/src/Common/ExceptionHandler/ExceptionHandler_emscripten.cpp b/src/Common/ExceptionHandler/ExceptionHandler_emscripten.cpp
+new file mode 100644
+index 00000000..dbb8c21a
+--- /dev/null
++++ b/src/Common/ExceptionHandler/ExceptionHandler_emscripten.cpp
+@@ -0,0 +1,6 @@
++// WebAssembly has no signals or backtraces; traps surface as JavaScript exceptions instead.
++#include "ExceptionHandler.h"
++
++void ExceptionHandler_Init()
++{
++}
+diff --git a/src/Common/platform.h b/src/Common/platform.h
+index 08462a97..2221c3b9 100644
+--- a/src/Common/platform.h
++++ b/src/Common/platform.h
+@@ -5,6 +5,9 @@
+ 
+ #if BOOST_OS_WINDOWS
+ #include "Common/windows/platform.h"
++#elif defined(__EMSCRIPTEN__)
++#include <byteswap.h>
++#include "Common/unix/platform.h"
+ #elif BOOST_OS_LINUX || BOOST_OS_BSD
+ #if BOOST_OS_LINUX
+ #include <byteswap.h>
+diff --git a/src/Common/precompiled.h b/src/Common/precompiled.h
+index b07d61b4..6b387fa0 100644
+--- a/src/Common/precompiled.h
++++ b/src/Common/precompiled.h
+@@ -373,6 +373,38 @@ inline unsigned char _addcarry_u64(unsigned char carry, unsigned long long a, un
+ 
+ #endif
+ 
++// WebAssembly: portable versions of the x86 intrinsics used by Cemu
++#if defined(__EMSCRIPTEN__)
++#include <time.h>
++
++inline void _mm_pause()
++{
++}
++
++inline uint64 __rdtsc()
++{
++	// nanosecond counter; PPCTimer measures the frequency at startup
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (uint64)ts.tv_sec * 1000000000ull + (uint64)ts.tv_nsec;
++}
++
++inline void _mm_mfence()
++{
++	std::atomic_thread_fence(std::memory_order_seq_cst);
++}
++
++inline unsigned char _addcarry_u64(unsigned char carry, unsigned long long a, unsigned long long b, unsigned long long *result)
++{
++	unsigned long long r = a + b;
++	unsigned char c = r < a;
++	r += carry;
++	c |= (r < (unsigned long long)carry);
++	*result = r;
++	return c;
++}
++#endif
++
+ // asserts
+ 
+ 
+@@ -501,7 +533,7 @@ bool match_any_of(T1&& value, Types&&... others)
+ #elif BOOST_OS_MACOS
+ 	return std::chrono::steady_clock::time_point(
+ 		std::chrono::nanoseconds(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)));
+-#elif BOOST_OS_BSD
++#elif BOOST_OS_BSD || defined(__EMSCRIPTEN__)
+ 	struct timespec tp;
+ 	clock_gettime(CLOCK_MONOTONIC, &tp);
+ 	return std::chrono::steady_clock::time_point(
+diff --git a/src/Common/unix/platform.cpp b/src/Common/unix/platform.cpp
+index 879ae4dc..878ab139 100644
+--- a/src/Common/unix/platform.cpp
++++ b/src/Common/unix/platform.cpp
+@@ -9,7 +9,7 @@ uint32_t GetTickCount()
+ 	return (1000 * ts.tv_sec + ts.tv_nsec / 1000000);
+ #elif BOOST_OS_MACOS
+ 	return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000000;
+-#elif BOOST_OS_BSD
++#elif BOOST_OS_BSD || defined(__EMSCRIPTEN__)
+ 	struct timespec ts;
+ 	clock_gettime(CLOCK_MONOTONIC, &ts);
+ 	return (1000 * ts.tv_sec + ts.tv_nsec / 1000000);
+diff --git a/src/input/api/DSU/DSUControllerProvider.h b/src/input/api/DSU/DSUControllerProvider.h
+index e19159c4..2a360f2f 100644
+--- a/src/input/api/DSU/DSUControllerProvider.h
++++ b/src/input/api/DSU/DSUControllerProvider.h
+@@ -8,8 +8,12 @@
+ #include "util/Socket/Socket.h"
+ 
+ #ifndef HAS_DSU
++#if defined(__EMSCRIPTEN__)
++#define HAS_DSU 0 // UDP sockets are not available in the browser
++#else
+ #define HAS_DSU 1
+ #endif
++#endif
+ 
+ // #define DEBUG_DSU_CLIENT
+ 
+diff --git a/src/resource/CMakeLists.txt b/src/resource/CMakeLists.txt
+index 74cdf03c..0aced932 100644
+--- a/src/resource/CMakeLists.txt
++++ b/src/resource/CMakeLists.txt
+@@ -13,7 +13,10 @@ embedded/resources.cpp
+ embedded/resources.h
+ )
+ 
+-if(UNIX)
++if(EMSCRIPTEN)
++    target_sources(CemuResource PRIVATE embedded/fontawesome_embed.c)
++    set_source_files_properties(embedded/fontawesome_embed.c PROPERTIES COMPILE_OPTIONS "-std=c23;-Wno-c23-extensions" SKIP_PRECOMPILE_HEADERS ON)
++elseif(UNIX)
+     if(NOT APPLE)
+         target_sources(CemuResource PRIVATE embedded/fontawesome.S)
+     else()
+diff --git a/src/resource/embedded/fontawesome_embed.c b/src/resource/embedded/fontawesome_embed.c
+new file mode 100644
+index 00000000..bcaf6f22
+--- /dev/null
++++ b/src/resource/embedded/fontawesome_embed.c
+@@ -0,0 +1,6 @@
++/* Resource embedding with C23 #embed, for toolchains without a GNU assembler (Emscripten). */
++#include <stdint.h>
++const char g_fontawesome_data[] = {
++#embed "../fontawesome-webfont.ttf"
++};
++const int g_fontawesome_size = sizeof(g_fontawesome_data);
+diff --git a/src/util/containers/flat_hash_map.hpp b/src/util/containers/flat_hash_map.hpp
+index 1eccc307..a5863506 100644
+--- a/src/util/containers/flat_hash_map.hpp
++++ b/src/util/containers/flat_hash_map.hpp
+@@ -1123,7 +1123,7 @@ namespace ska
+ 			// you now have large gaps which you would hit if somebody called reserve() with an unlucky number.
+ 			// 4. to fill the gaps for every prime p go to wolfram alpha and get ClosestPrime(p * 2^(1/3)) and ClosestPrime(p * 2^(2/3)) and put those in the gaps
+ 			// 5. get PrevPrime(2^64) and put it at the end
+-			static constexpr const size_t prime_list[] =
++			static constexpr const unsigned long long prime_list[] = // 64-bit even when size_t is 32-bit (wasm32)
+ 			{
+ 				2llu, 3llu, 5llu, 7llu, 11llu, 13llu, 17llu, 23llu, 29llu, 37llu, 47llu,
+ 				59llu, 73llu, 97llu, 127llu, 151llu, 197llu, 251llu, 313llu, 397llu,
+@@ -1210,8 +1210,8 @@ namespace ska
+ 				&mod5746614499066534157, &mod7240280573005008577, &mod9122181901073924329,
+ 				&mod11493228998133068689, &mod14480561146010017169, &mod18446744073709551557
+ 			};
+-			const size_t* found = std::lower_bound(std::begin(prime_list), std::end(prime_list) - 1, size);
+-			size = *found;
++			const auto* found = std::lower_bound(std::begin(prime_list), std::end(prime_list) - 1, (unsigned long long)size);
++			size = (size_t)*found;
+ 			return mod_functions[1 + found - prime_list];
+ 		}
+ 		void commit(mod_function new_mod_function)
+diff --git a/src/util/helpers/helpers.cpp b/src/util/helpers/helpers.cpp
+index d13a31a2..d95c6a59 100644
+--- a/src/util/helpers/helpers.cpp
++++ b/src/util/helpers/helpers.cpp
+@@ -145,6 +145,8 @@ void SetThreadName(const char* name)
+ #endif
+ #elif BOOST_OS_MACOS
+ 	pthread_setname_np(name);
++#elif defined(__EMSCRIPTEN__)
++	(void)name; // no thread names in WebAssembly workers
+ #else
+ 	if(std::strlen(name) > 15)
+ 		cemuLog_log(LogType::Force, "Truncating thread name {} because it was longer than 15 characters", name);
+diff --git a/src/util/highresolutiontimer/HighResolutionTimer.cpp b/src/util/highresolutiontimer/HighResolutionTimer.cpp
+index 6bb96a8d..a856276c 100644
+--- a/src/util/highresolutiontimer/HighResolutionTimer.cpp
++++ b/src/util/highresolutiontimer/HighResolutionTimer.cpp
+@@ -13,7 +13,7 @@ HighResolutionTimer HighResolutionTimer::now()
+     return HighResolutionTimer(nsec);
+ #elif BOOST_OS_MACOS
+ 	return HighResolutionTimer(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW));
+-#elif BOOST_OS_BSD
++#elif BOOST_OS_BSD || defined(__EMSCRIPTEN__)
+     timespec pc;
+     clock_gettime(CLOCK_MONOTONIC, &pc);
+     uint64 nsec = (uint64)pc.tv_sec * (uint64)1000000000 + (uint64)pc.tv_nsec;
+@@ -31,7 +31,7 @@ uint64 HighResolutionTimer::m_freq = []() -> uint64 {
+ 	LARGE_INTEGER freq;
+ 	QueryPerformanceFrequency(&freq);
+ 	return (uint64)(freq.QuadPart);
+-#elif BOOST_OS_MACOS
++#elif BOOST_OS_MACOS || defined(__EMSCRIPTEN__)
+ 	return 1000000000;
+ #elif BOOST_OS_BSD
+ 	timespec pc;
+-- 
+2.43.0
+

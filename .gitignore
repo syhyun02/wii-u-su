@@ -27,3 +27,4 @@ dist/
 emsdk/
 *.wasm
 node_modules/
+build-wasm-deps

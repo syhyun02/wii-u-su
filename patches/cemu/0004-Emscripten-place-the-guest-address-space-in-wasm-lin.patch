@@ -1,0 +1,178 @@
+From fbe33fd7bf058a275424491f7af7ced6a3ec2bcd Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 26 Nov 2026 08:56:40 +0000
+Subject: [PATCH 4/5] Emscripten: place the guest address space in wasm linear
+ memory
+
+Rotated mapping host = (guest + 0x20010000) mod 2^32: the guest regions from
+0xE0000000 land at host 0x00010000 and those from 0x00010000 at 0x20020000;
+the frontend links Emscripten's data/heap above 0x70100000. MemMapper becomes
+a no-op allocator, pointer range checks use MMU_IsInPPCMemorySpace.
+---
+ src/Cafe/HW/MMU/MMU.cpp                    |  5 ++
+ src/Cafe/HW/MMU/MMU.h                      |  7 ++-
+ src/Cafe/OS/RPL/rpl.cpp                    |  4 +-
+ src/util/CMakeLists.txt                    |  4 ++
+ src/util/MemMapper/MemMapper.h             |  6 +++
+ src/util/MemMapper/MemMapperEmscripten.cpp | 55 ++++++++++++++++++++++
+ 6 files changed, 78 insertions(+), 3 deletions(-)
+ create mode 100644 src/util/MemMapper/MemMapperEmscripten.cpp
+
+diff --git a/src/Cafe/HW/MMU/MMU.cpp b/src/Cafe/HW/MMU/MMU.cpp
+index b9baf178..a1db2fdd 100644
+--- a/src/Cafe/HW/MMU/MMU.cpp
++++ b/src/Cafe/HW/MMU/MMU.cpp
+@@ -129,8 +129,13 @@ MMURange mmuRange_HIGHMEM				{ 0xFFFFF000, 0x00001000, MMU_MEM_AREA_ID::CPU_PER_
+ void memory_init()
+ {
+ 	// reserve a continous range of 4GB
++#if defined(__EMSCRIPTEN__)
++	if(!memory_base)
++		memory_base = (uint8*)(uintptr_t)CEMU_WASM_GUEST_BASE; // fixed location inside the wasm linear memory
++#else
+ 	if(!memory_base)
+ 		memory_base = (uint8*)MemMapper::ReserveMemory(nullptr, (size_t)0x100000000, MemMapper::PAGE_PERMISSION::P_RW);
++#endif
+ 	if( !memory_base )
+ 	{
+ 		debug_printf("memory_init(): Unable to reserve 4GB of memory\n");
+diff --git a/src/Cafe/HW/MMU/MMU.h b/src/Cafe/HW/MMU/MMU.h
+index 56fc34e6..2ae7ccbc 100644
+--- a/src/Cafe/HW/MMU/MMU.h
++++ b/src/Cafe/HW/MMU/MMU.h
+@@ -178,7 +178,7 @@ bool memory_isAddressRangeAccessible(MPTR virtualAddress, uint32 size);
+ #define CPU_swapEndianU64(_v) _byteswap_uint64((uint64)(_v))
+ #define CPU_swapEndianU32(_v) _byteswap_ulong((uint32)(_v))
+ #define CPU_swapEndianU16(_v) _byteswap_ushort((uint16)(_v))
+-#elif BOOST_OS_LINUX
++#elif BOOST_OS_LINUX || defined(__EMSCRIPTEN__)
+ #define CPU_swapEndianU64(_v) bswap_64((uint64)(_v))
+ #define CPU_swapEndianU32(_v) bswap_32((uint32)(_v))
+ #define CPU_swapEndianU16(_v) bswap_16((uint16)(_v))
+@@ -278,4 +278,9 @@ namespace MMU
+ 
+ }
+ 
++#if defined(__EMSCRIPTEN__)
++// rotated mapping: every host address below Emscripten's static data (GLOBAL_BASE) belongs to the guest address space
++#define MMU_IsInPPCMemorySpace(__ptr) ((uintptr_t)(const uint8*)(__ptr) < 0x70100000u)
++#else
+ #define MMU_IsInPPCMemorySpace(__ptr) ((const uint8*)(__ptr) >= memory_base && (const uint8*)(__ptr) < (memory_base + 0x100000000))
++#endif
+diff --git a/src/Cafe/OS/RPL/rpl.cpp b/src/Cafe/OS/RPL/rpl.cpp
+index 19df0853..3e802be4 100644
+--- a/src/Cafe/OS/RPL/rpl.cpp
++++ b/src/Cafe/OS/RPL/rpl.cpp
+@@ -943,7 +943,7 @@ bool RPLLoader_FixImportSymbols(RPLModule* rplLoaderContext, sint32 symtabSectio
+ 			}
+ 			if (symbolOffset < 8)
+ 			{
+-				cemu_assert(symbolSectionAddress >= memory_base && symbolSectionAddress <= (memory_base + 0x100000000ULL));
++				cemu_assert(MMU_IsInPPCMemorySpace(symbolSectionAddress));
+ 				uint32 symbolSectionMPTR = memory_getVirtualOffsetFromPointer(symbolSectionAddress);
+ 				uint32 symbolRelativeAddress = (uint32)sym->symbolAddress - (uint32)symbolSection.virtualAddress;
+ 
+@@ -1050,7 +1050,7 @@ bool RPLLoader_FixImportSymbols(RPLModule* rplLoaderContext, sint32 symtabSectio
+ 				)
+ 			{
+ 				// update virtual address to match actual mapped address
+-				cemu_assert(symbolSectionAddress >= memory_base && symbolSectionAddress <= (memory_base + 0x100000000ULL));
++				cemu_assert(MMU_IsInPPCMemorySpace(symbolSectionAddress));
+ 				uint32 symbolSectionMPTR = memory_getVirtualOffsetFromPointer(symbolSectionAddress);
+ 				uint32 symbolRelativeAddress = (uint32)sym->symbolAddress - (uint32)symbolSection.virtualAddress;
+ 				sym->symbolAddress = (symbolSectionMPTR + symbolRelativeAddress);
+diff --git a/src/util/CMakeLists.txt b/src/util/CMakeLists.txt
+index dee41a5b..e42eee73 100644
+--- a/src/util/CMakeLists.txt
++++ b/src/util/CMakeLists.txt
+@@ -73,6 +73,10 @@ if(WIN32)
+ 	target_sources(CemuUtil PRIVATE Fiber/FiberWin.cpp)
+ 	target_sources(CemuUtil PRIVATE MemMapper/MemMapperWin.cpp)
+ 	target_sources(CemuUtil PRIVATE SystemInfo/SystemInfoWin.cpp)
++elseif(EMSCRIPTEN)
++	target_sources(CemuUtil PRIVATE Fiber/FiberEmscripten.cpp)
++	target_sources(CemuUtil PRIVATE MemMapper/MemMapperEmscripten.cpp)
++	target_sources(CemuUtil PRIVATE SystemInfo/SystemInfoStub.cpp)
+ elseif(UNIX)
+ 	target_sources(CemuUtil PRIVATE Fiber/FiberUnix.cpp)
+ 	target_sources(CemuUtil PRIVATE MemMapper/MemMapperUnix.cpp)
+diff --git a/src/util/MemMapper/MemMapper.h b/src/util/MemMapper/MemMapper.h
+index be307384..3037686e 100644
+--- a/src/util/MemMapper/MemMapper.h
++++ b/src/util/MemMapper/MemMapper.h
+@@ -1,5 +1,11 @@
+ #pragma once
+ 
++#if defined(__EMSCRIPTEN__)
++// host address of guest address 0 in the wasm linear memory. Guest addresses wrap around 2^32, so the guest
++// regions at 0xE0000000+ land at host 0x00010000+ and the regions from 0x00010000 to 0x50000000 at 0x20020000+.
++#define CEMU_WASM_GUEST_BASE 0x20010000u
++#endif
++
+ namespace MemMapper
+ {
+ 	enum class PAGE_PERMISSION : uint32
+diff --git a/src/util/MemMapper/MemMapperEmscripten.cpp b/src/util/MemMapper/MemMapperEmscripten.cpp
+new file mode 100644
+index 00000000..ee70d724
+--- /dev/null
++++ b/src/util/MemMapper/MemMapperEmscripten.cpp
+@@ -0,0 +1,55 @@
++// MemMapper for WebAssembly (wasm32).
++// There is no virtual memory: the wasm linear memory is one contiguous, zero-initialised block.
++// The 4GB Wii U address space is placed into it with a rotated mapping, host = (guest + CEMU_WASM_GUEST_BASE) mod 2^32
++// (see NOTES.md, section 4.3). The linker puts Emscripten's own data, stack and heap above the guest regions
++// (-sGLOBAL_BASE), so "reserving" and "committing" guest memory needs no work.
++#include "util/MemMapper/MemMapper.h"
++#include <cstdlib>
++#include <cstring>
++
++extern "C" char __global_base; // provided by wasm-ld: start of Emscripten's static data
++
++namespace MemMapper
++{
++	size_t GetPageSize()
++	{
++		return 4096;
++	}
++
++	static bool IsGuestPointer(void* p)
++	{
++		// guest memory occupies host addresses below the start of Emscripten's static data
++		return (uintptr_t)p < (uintptr_t)&__global_base;
++	}
++
++	void* ReserveMemory(void* baseAddr, size_t size, PAGE_PERMISSION permissionFlags)
++	{
++		cemu_assert(baseAddr == nullptr);
++		void* p = aligned_alloc(4096, (size + 4095) & ~(size_t)4095);
++		if (p)
++			memset(p, 0, size);
++		return p;
++	}
++
++	void FreeReservation(void* baseAddr, size_t size)
++	{
++		if (!IsGuestPointer(baseAddr))
++			free(baseAddr);
++	}
++
++	void* AllocateMemory(void* baseAddr, size_t size, PAGE_PERMISSION permissionFlags, bool fromReservation)
++	{
++		if (fromReservation)
++			return baseAddr; // memory is always present and zeroed (FreeMemory clears it again)
++		cemu_assert(baseAddr == nullptr);
++		return ReserveMemory(nullptr, size, permissionFlags);
++	}
++
++	void FreeMemory(void* baseAddr, size_t size, bool fromReservation)
++	{
++		if (fromReservation)
++			memset(baseAddr, 0, size); // emulate returning the pages to the OS
++		else
++			free(baseAddr);
++	}
++};
+-- 
+2.43.0
+

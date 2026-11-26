@@ -1,7 +1,7 @@
 From cbe3e30b18a292dc2b002e691fbfe435b2a14871 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 26 Nov 2026 08:24:22 +0000
-Subject: [PATCH 1/2] CMake: allow an external frontend instead of the
+Subject: [PATCH 1/5] CMake: allow an external frontend instead of the
  wxWidgets executable
 
 CEMU_FRONTEND_DIR builds a frontend project from outside the tree in place of

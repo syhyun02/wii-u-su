@@ -27,6 +27,9 @@
 #include "Cafe/HW/Espresso/PPCState.h"
 #include "Common/ExceptionHandler/ExceptionHandler.h"
 #include "NullRenderer.h"
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#endif
 
 // symbols that the wx build defines in src/main.cpp
 std::atomic_bool g_isGPUInitFinished = false;
@@ -38,6 +41,16 @@ void PPCTimer_init();
 namespace
 {
 	std::atomic_bool s_processExited = false;
+
+	[[noreturn]] void Quit(int code)
+	{
+		fflush(stdout);
+		fflush(stderr);
+#if defined(__EMSCRIPTEN__)
+		emscripten_force_exit(code); // also stops the worker threads
+#endif
+		_Exit(code);
+	}
 
 	class HeadlessSystem : public CafeSystem::SystemImplementation
 	{
@@ -197,12 +210,10 @@ int main(int argc, char* argv[])
 		if (runSeconds > 0.0 && elapsed >= runSeconds)
 		{
 			fmt::print("[headless] time limit reached ({}s), swaps={} draws={}\n", runSeconds, nullRenderer->GetSwapCount(), nullRenderer->GetDrawCount());
-			fflush(stdout);
-			_Exit(0);
+			Quit(0);
 		}
 	}
 	auto status = CafeSystem::GetForegroundTitleReturnStatus();
 	fmt::print("[headless] title exited with status {}\n", status.value_or(-1));
-	fflush(stdout);
-	_Exit(status.value_or(0) & 0xFF);
+	Quit(status.value_or(0) & 0xFF);
 }

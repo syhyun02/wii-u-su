@@ -1,0 +1,337 @@
+From 1fe717c82e3744c7e2af048bf017691d3419ab19 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 26 Nov 2026 08:56:40 +0000
+Subject: [PATCH 3/5] Emscripten: fibers as baton-passing pthreads
+
+WebAssembly cannot switch stacks, so each fiber runs on its own pthread and
+Fiber::Switch hands control over with a semaphore. Thread-locals that belong to
+the emulated core (assigned core, scheduler fiber, scheduler lock count, current
+PPC instance) become CEMU_FIBER_LOCAL and are handed over on every switch.
+The scheduler lock is held across fiber switches, so on Emscripten it is an
+ownerless lock instead of a recursive pthread mutex.
+---
+ .../Interpreter/PPCInterpreterMain.cpp        |   3 +-
+ .../OS/libs/coreinit/coreinit_Scheduler.cpp   |  43 +++++-
+ src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp |   4 +-
+ src/util/Fiber/Fiber.h                        |  39 ++++-
+ src/util/Fiber/FiberEmscripten.cpp            | 146 ++++++++++++++++++
+ 5 files changed, 225 insertions(+), 10 deletions(-)
+ create mode 100644 src/util/Fiber/FiberEmscripten.cpp
+
+diff --git a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterMain.cpp b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterMain.cpp
+index 00f9ecee..27a5b2cc 100644
+--- a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterMain.cpp
++++ b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterMain.cpp
+@@ -1,9 +1,10 @@
+ #include "PPCInterpreterInternal.h"
++#include "util/Fiber/Fiber.h"
+ #include "Cafe/OS/RPL/rpl.h"
+ #include "Cafe/GameProfile/GameProfile.h"
+ #include "Cafe/HW/Espresso/Debugger/Debugger.h"
+ 
+-thread_local PPCInterpreter_t* ppcInterpreterCurrentInstance;
++CEMU_FIBER_LOCAL(PPCInterpreter_t*, ppcInterpreterCurrentInstance);
+ 
+ // main thread instruction counter and timing
+ uint64 ppcMainThreadDECCycleValue = 0; // value that was set to dec register
+diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Scheduler.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Scheduler.cpp
+index bb310778..7203232d 100644
+--- a/src/Cafe/OS/libs/coreinit/coreinit_Scheduler.cpp
++++ b/src/Cafe/OS/libs/coreinit/coreinit_Scheduler.cpp
+@@ -1,9 +1,32 @@
+ #include "Cafe/OS/common/OSCommon.h"
++#include "util/Fiber/Fiber.h"
+ #include "coreinit_Scheduler.h"
+ 
+-thread_local sint32 s_schedulerLockCount = 0;
++CEMU_FIBER_LOCAL(sint32, s_schedulerLockCount);
+ 
+-#if BOOST_OS_WINDOWS
++#if defined(__EMSCRIPTEN__)
++// The scheduler lock is held across fiber switches. On Emscripten every fiber is a separate host thread,
++// so the lock must not be owned by a thread: a fiber may unlock what another fiber locked.
++#include <atomic>
++class OwnerlessLock
++{
++public:
++	void lock()
++	{
++		while (m_locked.exchange(true, std::memory_order_acquire))
++			m_locked.wait(true, std::memory_order_relaxed);
++	}
++	bool try_lock() { return !m_locked.exchange(true, std::memory_order_acquire); }
++	void unlock()
++	{
++		m_locked.store(false, std::memory_order_release);
++		m_locked.notify_one();
++	}
++private:
++	std::atomic<bool> m_locked{false};
++};
++OwnerlessLock s_schedulerLock;
++#elif BOOST_OS_WINDOWS
+ #include <synchapi.h>
+ CRITICAL_SECTION s_csSchedulerLock;
+ #else
+@@ -13,7 +36,9 @@ pthread_mutex_t s_ptmSchedulerLock;
+ 
+ void __OSLockScheduler(void* obj)
+ {
+-#if BOOST_OS_WINDOWS
++#if defined(__EMSCRIPTEN__)
++	s_schedulerLock.lock();
++#elif BOOST_OS_WINDOWS
+ 	EnterCriticalSection(&s_csSchedulerLock);
+ #else
+ 	pthread_mutex_lock(&s_ptmSchedulerLock);
+@@ -30,7 +55,9 @@ bool __OSHasSchedulerLock()
+ bool __OSTryLockScheduler(void* obj)
+ {
+ 	bool r;
+-#if BOOST_OS_WINDOWS
++#if defined(__EMSCRIPTEN__)
++	r = s_schedulerLock.try_lock();
++#elif BOOST_OS_WINDOWS
+ 	r = TryEnterCriticalSection(&s_csSchedulerLock);
+ #else
+ 	r = pthread_mutex_trylock(&s_ptmSchedulerLock) == 0;
+@@ -47,7 +74,9 @@ void __OSUnlockScheduler(void* obj)
+ {
+ 	s_schedulerLockCount--;
+ 	cemu_assert_debug(s_schedulerLockCount >= 0);
+-#if BOOST_OS_WINDOWS
++#if defined(__EMSCRIPTEN__)
++	s_schedulerLock.unlock();
++#elif BOOST_OS_WINDOWS
+ 	LeaveCriticalSection(&s_csSchedulerLock);
+ #else
+ 	pthread_mutex_unlock(&s_ptmSchedulerLock);
+@@ -107,7 +136,9 @@ namespace coreinit
+ 
+ 	void InitializeSchedulerLock()
+ 	{
+-#if BOOST_OS_WINDOWS
++#if defined(__EMSCRIPTEN__)
++		// statically initialized
++#elif BOOST_OS_WINDOWS
+ 		InitializeCriticalSection(&s_csSchedulerLock);
+ #else
+ 		pthread_mutexattr_t ma;
+diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
+index 08b93b1f..05951c1f 100644
+--- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
++++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
+@@ -71,8 +71,8 @@ namespace coreinit
+ 
+ 	bool g_isMulticoreMode;
+ 
+-	thread_local uint32 t_assignedCoreIndex;
+-	thread_local Fiber* t_schedulerFiber;
++	CEMU_FIBER_LOCAL(uint32, t_assignedCoreIndex);
++	CEMU_FIBER_LOCAL(Fiber*, t_schedulerFiber);
+ 
+ 	struct OSHostThread
+ 	{
+diff --git a/src/util/Fiber/Fiber.h b/src/util/Fiber/Fiber.h
+index c72c62fc..ee3b758b 100644
+--- a/src/util/Fiber/Fiber.h
++++ b/src/util/Fiber/Fiber.h
+@@ -19,4 +19,41 @@ private:
+ 	void* m_implData{nullptr};
+ 	void* m_privateData;
+ 	void* m_stackPtr{ nullptr };
+-};
+\ No newline at end of file
++};
++
++// CEMU_FIBER_LOCAL(type, name): a thread_local that belongs to the emulated CPU core rather than to the host thread.
++// On most platforms all fibers of a core run on one host thread, so this is a plain thread_local.
++// On Emscripten each fiber is its own host thread (there is no ucontext); the values are handed over on every
++// Fiber::Switch so the code observes the same semantics.
++#if defined(__EMSCRIPTEN__)
++namespace FiberLocal
++{
++	constexpr size_t kBlockSize = 256;
++	struct Block { alignas(16) uint8 data[kBlockSize]; };
++	Block& CurrentBlock();
++	size_t Reserve(size_t size, size_t align);
++}
++
++template<typename T>
++class fiber_local
++{
++	static_assert(std::is_trivially_copyable_v<T>);
++public:
++	fiber_local() : m_offset(FiberLocal::Reserve(sizeof(T), alignof(T))) {}
++	fiber_local(const T& v) : fiber_local() {} // initial value must be zero; the storage starts zeroed
++	T& get() const { return *reinterpret_cast<T*>(FiberLocal::CurrentBlock().data + m_offset); }
++	operator T&() const { return get(); }
++	fiber_local& operator=(const T& v) { get() = v; return *this; }
++	T operator->() const { return get(); }
++	T& operator++() { return ++get(); }
++	T operator++(int) { return get()++; }
++	T& operator--() { return --get(); }
++	T operator--(int) { return get()--; }
++private:
++	size_t m_offset;
++};
++#define CEMU_FIBER_LOCAL(type, name) fiber_local<type> name
++#else
++#define CEMU_FIBER_LOCAL(type, name) thread_local type name
++#endif
++
+diff --git a/src/util/Fiber/FiberEmscripten.cpp b/src/util/Fiber/FiberEmscripten.cpp
+new file mode 100644
+index 00000000..0b3c3c6f
+--- /dev/null
++++ b/src/util/Fiber/FiberEmscripten.cpp
+@@ -0,0 +1,146 @@
++// Fiber implementation for WebAssembly (Emscripten).
++// WebAssembly cannot switch stacks, so every fiber runs on its own pthread and control is handed over
++// like a baton: Switch() wakes the target thread and puts the current one to sleep. Only one thread
++// of a fiber chain runs at any time, so the observable behaviour matches the ucontext implementation.
++#include "Fiber.h"
++#include <pthread.h>
++#include <semaphore>
++#include <atomic>
++#include <memory>
++
++namespace
++{
++	struct FiberImpl
++	{
++		std::binary_semaphore wake{0};
++		void (*entry)(void*) = nullptr;
++		void* userParam = nullptr;
++		Fiber* fiber = nullptr;
++		bool started = false;
++		std::atomic_bool exitRequested{false};
++		FiberLocal::Block* incomingBlock = nullptr; // core-local storage handed over by the fiber that woke us
++	};
++
++	thread_local Fiber* sCurrentFiber{};
++	thread_local std::shared_ptr<FiberImpl>* sCurrentImpl{};
++	thread_local FiberLocal::Block t_ownBlock{};
++	thread_local FiberLocal::Block* t_block{};
++	std::atomic<size_t> s_reservedBytes{0};
++
++	constexpr size_t kFiberStackSize = 2 * 1024 * 1024;
++	const bool s_trace = getenv("CEMU_FIBER_TRACE") != nullptr;
++
++	void* FiberThreadMain(void* arg)
++	{
++		auto* implRef = static_cast<std::shared_ptr<FiberImpl>*>(arg);
++		FiberImpl& impl = **implRef;
++		sCurrentImpl = implRef;
++		sCurrentFiber = impl.fiber;
++		t_block = impl.incomingBlock;
++		impl.entry(impl.userParam);
++		// fiber entry points are not supposed to return
++		cemu_assert_debug(false);
++		return nullptr;
++	}
++}
++
++namespace FiberLocal
++{
++	Block& CurrentBlock()
++	{
++		return t_block ? *t_block : t_ownBlock;
++	}
++
++	size_t Reserve(size_t size, size_t align)
++	{
++		size_t offset = s_reservedBytes.load();
++		size_t aligned;
++		do
++		{
++			aligned = (offset + align - 1) & ~(align - 1);
++		} while (!s_reservedBytes.compare_exchange_weak(offset, aligned + size));
++		cemu_assert(aligned + size <= kBlockSize);
++		return aligned;
++	}
++}
++
++Fiber::Fiber(void(*FiberEntryPoint)(void* userParam), void* userParam, void* privateData) : m_privateData(privateData)
++{
++	auto impl = new std::shared_ptr<FiberImpl>(std::make_shared<FiberImpl>());
++	(*impl)->entry = FiberEntryPoint;
++	(*impl)->userParam = userParam;
++	(*impl)->fiber = this;
++	m_implData = impl;
++}
++
++Fiber::Fiber(void* privateData) : m_privateData(privateData)
++{
++	auto impl = new std::shared_ptr<FiberImpl>(std::make_shared<FiberImpl>());
++	(*impl)->fiber = this;
++	(*impl)->started = true; // represents an already running thread
++	m_implData = impl;
++}
++
++Fiber::~Fiber()
++{
++	auto* implRef = static_cast<std::shared_ptr<FiberImpl>*>(m_implData);
++	std::shared_ptr<FiberImpl> impl = *implRef;
++	impl->fiber = nullptr;
++	if (impl->entry && impl->started)
++	{
++		// the fiber's thread is parked inside Switch(): let it terminate. It keeps its own reference to impl
++		impl->exitRequested = true;
++		impl->wake.release();
++	}
++	else
++	{
++		delete implRef;
++	}
++}
++
++Fiber* Fiber::PrepareCurrentThread(void* privateData)
++{
++	cemu_assert_debug(sCurrentFiber == nullptr);
++	sCurrentFiber = new Fiber(privateData);
++	sCurrentImpl = static_cast<std::shared_ptr<FiberImpl>*>(sCurrentFiber->m_implData);
++	t_block = &t_ownBlock;
++	return sCurrentFiber;
++}
++
++void Fiber::Switch(Fiber& targetFiber)
++{
++	std::shared_ptr<FiberImpl> self = *sCurrentImpl; // keep alive even if our Fiber object is deleted meanwhile
++	FiberImpl& target = **static_cast<std::shared_ptr<FiberImpl>*>(targetFiber.m_implData);
++	target.incomingBlock = &FiberLocal::CurrentBlock();
++	if (s_trace)
++		fprintf(stderr, "[fiber] %p -> %p%s\n", (void*)sCurrentFiber, (void*)&targetFiber, target.started ? "" : " (start)");
++	if (!target.started)
++	{
++		target.started = true;
++		pthread_attr_t attr;
++		pthread_attr_init(&attr);
++		pthread_attr_setstacksize(&attr, kFiberStackSize);
++		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++		pthread_t thread;
++		int r = pthread_create(&thread, &attr, FiberThreadMain, targetFiber.m_implData);
++		pthread_attr_destroy(&attr);
++		cemu_assert(r == 0);
++	}
++	else
++	{
++		target.wake.release();
++	}
++	self->wake.acquire();
++	if (self->exitRequested)
++	{
++		self.reset();
++		delete sCurrentImpl;
++		pthread_exit(nullptr);
++	}
++	t_block = self->incomingBlock;
++}
++
++void* Fiber::GetFiberPrivateData()
++{
++	return sCurrentFiber->m_privateData;
++}
+-- 
+2.43.0
+
