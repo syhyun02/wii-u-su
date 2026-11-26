@@ -7,9 +7,10 @@
 | 항목 | 상태 |
 |---|---|
 | 1단계: 분석과 계획 | ✅ 완료 (2026-11-26) |
-| 원본 Cemu | `upstream/Cemu` git 서브모듈, upstream `2f49c079` (2026-11-20, "Vulkan: Always use identity view for attachments")에 고정 |
-| Cemu 코드 수정 | 아직 없음 |
-| 빌드 | 아직 시도 안 함 (다음 단계는 [§6 2단계 작업 목록](#6-다음에-할-일-2단계-첫-작업)) |
+| P1 네이티브 헤드리스 | ✅ 테스트 홈브루 부팅, 결과값이 호스트 기준값과 일치 (`scripts/build-native.sh`) |
+| P2 wasm 헤드리스 | 🚧 전체 링크 성공(10.7MB), Node에서 RPX 로드·링크·첫 게스트 스레드 실행까지. `coreinit_start`의 메모리 범위 밖 접근 조사 중 |
+| 원본 Cemu | `upstream/Cemu` git 서브모듈, upstream `2f49c079` (2026-11-20)에 고정 |
+| Cemu 코드 수정 | `patches/cemu/0001-0005` (적용: `scripts/apply-patches.sh`) |
 
 > **원칙:** 게임 이미지(`.wud/.wux/.wua/.rpx` 덤프 등), `keys.txt`, `otp.bin`, `seeprom.bin`, `mlc01/` 같은
 > 콘솔 데이터는 저장소에 절대 넣지 않는다. `.gitignore`로 막아 두었다. 테스트용 홈브루는 **우리가 소스에서 직접
@@ -413,6 +414,30 @@ Wii U(3코어 1.24GHz + R700급 GPU)는 3DS보다 요구 성능이 훨씬 크므
     Memory64는 당장 필요하지 않다고 판단.
 - 검증하지 않은 가정 (2단계에서 확인): 회전 매핑에서 Emscripten 힙 배치 제어, Fiber 대체의 전환 비용,
   Cemu 코드의 64비트 포인터 가정의 실제 양, Cemu 인터프리터 속도.
+
+### 2026-11-26 — P1 네이티브 헤드리스, P2 wasm 빌드
+
+**P1 (네이티브, 완료)**
+- `frontend/headless/`: wx 없는 `main`, `WindowSystem` 스텁, `NullRenderer`(그리지 않는 `Renderer` 구현, 텍스처/셰이더/FBO/쿼리 더미).
+  Latte 스레드는 게임과 관계없이 항상 렌더러를 요구하므로 NullRenderer가 필요했다. 나중에 WebGPU 렌더러가 이 자리에 들어간다.
+- Cemu 패치 0001: `CEMU_FRONTEND_DIR`로 외부 프런트엔드를 빌드 (wx일 때만 X11/GTK3 요구).
+- Cemu 패치 0002: 그래픽 백엔드가 하나도 없을 때 생기는 문제 3개 (기본 API assert, `VulkanRendererConst`, `robin_hood` include).
+- `tests/homebrew/hello`: devkitPro Docker 이미지(devkitPPC+wut)로 빌드하는 테스트 프로그램. CRC32, 정수 연산, 부동소수점, 스레드 2개, printf.
+- 결과: `--force-interpreter`로 끝까지 실행, 결정적인 출력 3개(crc32, int, threads)가 호스트에서 컴파일한 같은 C 코드의 결과와 일치.
+  (홈브루가 main에서 return한 뒤 프로세스 종료 신호가 오지 않는 문제는 남아 있음 — 시간 제한으로 종료.)
+
+**P2 (wasm, 진행 중)**
+- 의존성 11개를 wasm32로 빌드 (`scripts/build-deps-wasm.sh`). Boost는 asio/interprocess를 빼야 boost.context 어셈블리를 피할 수 있다.
+- 컴파일 에러는 예상보다 훨씬 적었다: 바이트 스왑/시계 등 플랫폼 분기, x86 intrinsic 4개, ih264d generic 경로, `.S` 리소스 임베딩(→ `#embed`),
+  64비트 소수 테이블 하나. 링크 에러는 예상대로 `ucontext`(Fiber)뿐.
+- **Fiber (§3.3 T1)**: 후보 A(게스트 스레드마다 pthread + 바통 전달)로 구현 (`FiberEmscripten.cpp`).
+  - 발견 1: 에뮬레이션 코어를 따라다녀야 하는 thread_local이 4개 있다 → `CEMU_FIBER_LOCAL`로 바꾸고 전환 때 넘겨준다.
+  - 발견 2: 스케줄러 락(재귀 pthread mutex)을 잡은 채로 Fiber를 전환하고 다른 Fiber가 푼다 → "Fiber=스레드"에서는 데드락.
+    소유자 없는 락(atomic wait/notify)으로 교체.
+- **메모리 (§4.3 회전 매핑)**: 실제로 구현. `CEMU_WASM_GUEST_BASE = 0x20010000`, Emscripten 데이터는 `-sGLOBAL_BASE=1793MB`(0x70100000)부터,
+  `-sINITIAL_MEMORY=3072MB`. `MemMapper`는 할 일이 거의 없어졌다. 포인터 범위 assert 3곳을 `MMU_IsInPPCMemorySpace`로 교체.
+- 현재: Node에서 RPX 로드 → 링크 → 첫 게스트 스레드가 PPC 인터프리터로 실행 → `coreinit_start`(HLE)에서 out-of-bounds.
+  디버그 정보 빌드로 위치 확인 중.
 
 ### 참고 링크
 

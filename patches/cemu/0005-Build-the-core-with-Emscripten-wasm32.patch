@@ -1,7 +1,7 @@
 From 3b966a2ff929cd40b76a2efcae20e70ee899c21f Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 26 Nov 2026 08:56:40 +0000
-Subject: [PATCH 5/5] Build the core with Emscripten (wasm32)
+Subject: [PATCH 5/6] Build the core with Emscripten (wasm32)
 
 - CMake: glslang only with Vulkan/OpenGL, allow 32-bit pointers on Emscripten,
   ZArchive needs <cstdlib>, ExceptionHandler stub, fontawesome via #embed

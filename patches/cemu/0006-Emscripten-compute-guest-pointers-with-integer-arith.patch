@@ -1,0 +1,152 @@
+From 5905c6fbe9868dfe2dd32c18b2297ab75663caf1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 26 Nov 2026 09:11:39 +0000
+Subject: [PATCH 6/6] Emscripten: compute guest pointers with integer
+ arithmetic
+
+memory_base + guestAddress wraps around 2^32 with the rotated mapping. Pointer
+overflow is undefined in C++ and LLVM optimised on it (out-of-bounds access in
+coreinit's foreground bucket init), so on Emscripten memory_base is a small
+class whose operator+ adds integers. Other platforms keep uint8*.
+---
+ .../GraphicPack/GraphicPack2PatchesApply.cpp  |  4 +--
+ src/Cafe/HW/MMU/MMU.cpp                       |  6 ++--
+ src/Cafe/HW/MMU/MMU.h                         |  3 +-
+ src/Common/GuestMemoryBase.h                  | 33 +++++++++++++++++++
+ src/Common/MemPtr.h                           |  3 +-
+ 5 files changed, 42 insertions(+), 7 deletions(-)
+ create mode 100644 src/Common/GuestMemoryBase.h
+
+diff --git a/src/Cafe/GraphicPack/GraphicPack2PatchesApply.cpp b/src/Cafe/GraphicPack/GraphicPack2PatchesApply.cpp
+index 15fb8669..711b70cd 100644
+--- a/src/Cafe/GraphicPack/GraphicPack2PatchesApply.cpp
++++ b/src/Cafe/GraphicPack/GraphicPack2PatchesApply.cpp
+@@ -403,7 +403,7 @@ void PatchEntryInstruction::applyPatch()
+ 		cemu_assert_debug(false);
+ 		return;
+ 	}
+-	uint8* patchAddr = (uint8*)memory_base + addr;
++	uint8* patchAddr = memory_base + addr;
+ 	memcpy(m_dataBackup, patchAddr, m_length);
+ 	memcpy(patchAddr, m_dataWithRelocs, m_length);
+ 	PPCRecompiler_invalidateRange(addr, addr + m_length);
+@@ -417,7 +417,7 @@ void PatchEntryInstruction::undoPatch()
+ 		cemu_assert_debug(false);
+ 		return;
+ 	}
+-	uint8* patchAddr = (uint8*)memory_base + addr;
++	uint8* patchAddr = memory_base + addr;
+ 	memcpy(patchAddr, m_dataBackup, m_length);
+ 	PPCRecompiler_invalidateRange(addr, addr + m_length);
+ 	rplSymbolStorage_removeRange(addr, m_length, RPL_STORED_SYMBOL_PATCH);
+diff --git a/src/Cafe/HW/MMU/MMU.cpp b/src/Cafe/HW/MMU/MMU.cpp
+index a1db2fdd..11e6f27d 100644
+--- a/src/Cafe/HW/MMU/MMU.cpp
++++ b/src/Cafe/HW/MMU/MMU.cpp
+@@ -5,7 +5,7 @@
+ #include "util/MemMapper/MemMapper.h"
+ #include "config/ActiveSettings.h"
+ 
+-uint8* memory_base = NULL; // base address of the reserved 4GB space
++GuestMemoryBasePtr memory_base{}; // base address of the reserved 4GB space
+ uint8* memory_elfCodeArena = NULL;
+ 
+ void checkMemAlloc(void* result)
+@@ -131,7 +131,7 @@ void memory_init()
+ 	// reserve a continous range of 4GB
+ #if defined(__EMSCRIPTEN__)
+ 	if(!memory_base)
+-		memory_base = (uint8*)(uintptr_t)CEMU_WASM_GUEST_BASE; // fixed location inside the wasm linear memory
++		memory_base = (uint8*)(uintptr_t)CEMU_WASM_GUEST_BASE; // fixed location inside the wasm linear memory (see GuestMemoryBase.h)
+ #else
+ 	if(!memory_base)
+ 		memory_base = (uint8*)MemMapper::ReserveMemory(nullptr, (size_t)0x100000000, MemMapper::PAGE_PERMISSION::P_RW);
+@@ -294,7 +294,7 @@ uint32 memory_getVirtualOffsetFromPointer(void* ptr)
+ {
+ 	if( !ptr )
+ 		return MPTR_NULL;
+-	return (uint32)((uint8*)ptr - (uint8*)memory_base);
++	return (uint32)((uintptr_t)ptr - (uintptr_t)memory_base);
+ }
+ 
+ uint8* memory_getPointerFromVirtualOffset(uint32 virtualOffset)
+diff --git a/src/Cafe/HW/MMU/MMU.h b/src/Cafe/HW/MMU/MMU.h
+index 2ae7ccbc..8f3efb16 100644
+--- a/src/Cafe/HW/MMU/MMU.h
++++ b/src/Cafe/HW/MMU/MMU.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include "Common/GuestMemoryBase.h"
+ 
+ void memory_init();
+ void memory_mapForCurrentTitle();
+@@ -16,7 +17,7 @@ uint8* memory_getPointerFromPhysicalOffset(uint32 physicalOffset);
+ uint32 memory_virtualToPhysical(uint32 virtualOffset);
+ uint32 memory_physicalToVirtual(uint32 physicalOffset);
+ 
+-extern uint8* memory_base; // points to base of PowerPC address space
++extern GuestMemoryBasePtr memory_base; // points to base of PowerPC address space
+ 
+ enum class MMU_MEM_AREA_ID
+ {
+diff --git a/src/Common/GuestMemoryBase.h b/src/Common/GuestMemoryBase.h
+new file mode 100644
+index 00000000..585e8fa4
+--- /dev/null
++++ b/src/Common/GuestMemoryBase.h
+@@ -0,0 +1,33 @@
++#pragma once
++// Type of memory_base, the host address of PowerPC address 0.
++//
++// On Emscripten (wasm32) the guest address space is placed into the wasm linear memory with a rotated
++// mapping, host = (guest + base) mod 2^32, so "memory_base + guestAddress" must wrap around. In C++ a
++// pointer addition that overflows is undefined and LLVM really does optimise based on that (it broke
++// coreinit's foreground bucket init). GuestMemoryBase performs the addition on integers instead, so the
++// existing "memory_base + x" expressions keep working without undefined behaviour.
++#include <cstdint>
++#include <type_traits>
++
++#if defined(__EMSCRIPTEN__)
++class GuestMemoryBase
++{
++public:
++	GuestMemoryBase() = default;
++	GuestMemoryBase& operator=(uint8_t* p) { m_base = (uint32_t)(uintptr_t)p; return *this; }
++	operator uint8_t*() const { return (uint8_t*)(uintptr_t)m_base; }
++	explicit operator uintptr_t() const { return m_base; }
++	explicit operator bool() const { return m_base != 0; }
++	bool operator!() const { return m_base == 0; }
++
++	template<typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
++	uint8_t* operator+(T offset) const { return (uint8_t*)(uintptr_t)(uint32_t)(m_base + (uint32_t)offset); }
++
++	friend ptrdiff_t operator-(const void* p, const GuestMemoryBase& b) { return (ptrdiff_t)(uint32_t)((uint32_t)(uintptr_t)p - b.m_base); }
++private:
++	uint32_t m_base = 0;
++};
++using GuestMemoryBasePtr = GuestMemoryBase;
++#else
++using GuestMemoryBasePtr = uint8_t*;
++#endif
+diff --git a/src/Common/MemPtr.h b/src/Common/MemPtr.h
+index ecd40203..1dd24ca6 100644
+--- a/src/Common/MemPtr.h
++++ b/src/Common/MemPtr.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include "Common/GuestMemoryBase.h"
+ #include <type_traits>
+ #include "betype.h"
+ 
+@@ -9,7 +10,7 @@ using MPTR = uint32; // generic address in PowerPC memory space
+ using VAddr = uint32; // virtual address
+ using PAddr = uint32; // physical address
+ 
+-extern uint8* memory_base;
++extern GuestMemoryBasePtr memory_base;
+ extern uint8* PPCInterpreterGetStackPointer();
+ extern uint8* PPCInterpreter_PushAndReturnStackPointer(sint32 offset);
+ extern void PPCInterpreterModifyStackPointer(sint32 offset);
+-- 
+2.43.0
+

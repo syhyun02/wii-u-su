@@ -1,7 +1,7 @@
 From 3e00ba9e6575c0ac5655a20ed33d1b0183469ce2 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 26 Nov 2026 08:24:22 +0000
-Subject: [PATCH 2/5] Allow building the core without any built-in graphics
+Subject: [PATCH 2/6] Allow building the core without any built-in graphics
  backend
 
 - default graphics API and GetGraphicsAPI() no longer assert when OpenGL,

@@ -1,7 +1,7 @@
 From 1fe717c82e3744c7e2af048bf017691d3419ab19 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 26 Nov 2026 08:56:40 +0000
-Subject: [PATCH 3/5] Emscripten: fibers as baton-passing pthreads
+Subject: [PATCH 3/6] Emscripten: fibers as baton-passing pthreads
 
 WebAssembly cannot switch stacks, so each fiber runs on its own pthread and
 Fiber::Switch hands control over with a semaphore. Thread-locals that belong to

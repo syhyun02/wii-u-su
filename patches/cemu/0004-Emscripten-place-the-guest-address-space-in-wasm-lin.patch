@@ -1,7 +1,7 @@
 From fbe33fd7bf058a275424491f7af7ced6a3ec2bcd Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 26 Nov 2026 08:56:40 +0000
-Subject: [PATCH 4/5] Emscripten: place the guest address space in wasm linear
+Subject: [PATCH 4/6] Emscripten: place the guest address space in wasm linear
  memory
 
 Rotated mapping host = (guest + 0x20010000) mod 2^32: the guest regions from
