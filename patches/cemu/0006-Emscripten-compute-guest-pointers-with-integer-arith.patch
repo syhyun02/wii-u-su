@@ -1,4 +1,4 @@
-From 5905c6fbe9868dfe2dd32c18b2297ab75663caf1 Mon Sep 17 00:00:00 2001
+From 34d7446567001b296e54eba040e34811e979044b Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 26 Nov 2026 09:11:39 +0000
 Subject: [PATCH 6/6] Emscripten: compute guest pointers with integer
@@ -12,9 +12,9 @@ class whose operator+ adds integers. Other platforms keep uint8*.
  .../GraphicPack/GraphicPack2PatchesApply.cpp  |  4 +--
  src/Cafe/HW/MMU/MMU.cpp                       |  6 ++--
  src/Cafe/HW/MMU/MMU.h                         |  3 +-
- src/Common/GuestMemoryBase.h                  | 33 +++++++++++++++++++
+ src/Common/GuestMemoryBase.h                  | 35 +++++++++++++++++++
  src/Common/MemPtr.h                           |  3 +-
- 5 files changed, 42 insertions(+), 7 deletions(-)
+ 5 files changed, 44 insertions(+), 7 deletions(-)
  create mode 100644 src/Common/GuestMemoryBase.h
 
 diff --git a/src/Cafe/GraphicPack/GraphicPack2PatchesApply.cpp b/src/Cafe/GraphicPack/GraphicPack2PatchesApply.cpp
@@ -91,10 +91,10 @@ index 2ae7ccbc..8f3efb16 100644
  {
 diff --git a/src/Common/GuestMemoryBase.h b/src/Common/GuestMemoryBase.h
 new file mode 100644
-index 00000000..585e8fa4
+index 00000000..f1aa0ee8
 --- /dev/null
 +++ b/src/Common/GuestMemoryBase.h
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,35 @@
 +#pragma once
 +// Type of memory_base, the host address of PowerPC address 0.
 +//
@@ -114,13 +114,15 @@ index 00000000..585e8fa4
 +	GuestMemoryBase& operator=(uint8_t* p) { m_base = (uint32_t)(uintptr_t)p; return *this; }
 +	operator uint8_t*() const { return (uint8_t*)(uintptr_t)m_base; }
 +	explicit operator uintptr_t() const { return m_base; }
++	explicit operator unsigned long long() const { return m_base; }
 +	explicit operator bool() const { return m_base != 0; }
 +	bool operator!() const { return m_base == 0; }
 +
 +	template<typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
 +	uint8_t* operator+(T offset) const { return (uint8_t*)(uintptr_t)(uint32_t)(m_base + (uint32_t)offset); }
 +
-+	friend ptrdiff_t operator-(const void* p, const GuestMemoryBase& b) { return (ptrdiff_t)(uint32_t)((uint32_t)(uintptr_t)p - b.m_base); }
++	template<typename T>
++	friend ptrdiff_t operator-(T* p, const GuestMemoryBase& b) { return (ptrdiff_t)(uint32_t)((uint32_t)(uintptr_t)p - b.m_base); }
 +private:
 +	uint32_t m_base = 0;
 +};

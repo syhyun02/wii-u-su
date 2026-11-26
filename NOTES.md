@@ -8,9 +8,9 @@
 |---|---|
 | 1단계: 분석과 계획 | ✅ 완료 (2026-11-26) |
 | P1 네이티브 헤드리스 | ✅ 테스트 홈브루 부팅, 결과값이 호스트 기준값과 일치 (`scripts/build-native.sh`) |
-| P2 wasm 헤드리스 | 🚧 전체 링크 성공(10.7MB), Node에서 RPX 로드·링크·첫 게스트 스레드 실행까지. `coreinit_start`의 메모리 범위 밖 접근 조사 중 |
+| P2 wasm 헤드리스 | ✅ Node에서 테스트 홈브루가 끝까지 실행·정상 종료, 출력이 네이티브와 일치 (`scripts/build-wasm.sh`). 다음: 브라우저 페이지 |
 | 원본 Cemu | `upstream/Cemu` git 서브모듈, upstream `2f49c079` (2026-11-20)에 고정 |
-| Cemu 코드 수정 | `patches/cemu/0001-0005` (적용: `scripts/apply-patches.sh`) |
+| Cemu 코드 수정 | `patches/cemu/0001-0006` (적용: `scripts/apply-patches.sh`) |
 
 > **원칙:** 게임 이미지(`.wud/.wux/.wua/.rpx` 덤프 등), `keys.txt`, `otp.bin`, `seeprom.bin`, `mlc01/` 같은
 > 콘솔 데이터는 저장소에 절대 넣지 않는다. `.gitignore`로 막아 두었다. 테스트용 홈브루는 **우리가 소스에서 직접
@@ -436,8 +436,13 @@ Wii U(3코어 1.24GHz + R700급 GPU)는 3DS보다 요구 성능이 훨씬 크므
     소유자 없는 락(atomic wait/notify)으로 교체.
 - **메모리 (§4.3 회전 매핑)**: 실제로 구현. `CEMU_WASM_GUEST_BASE = 0x20010000`, Emscripten 데이터는 `-sGLOBAL_BASE=1793MB`(0x70100000)부터,
   `-sINITIAL_MEMORY=3072MB`. `MemMapper`는 할 일이 거의 없어졌다. 포인터 범위 assert 3곳을 `MMU_IsInPPCMemorySpace`로 교체.
-- 현재: Node에서 RPX 로드 → 링크 → 첫 게스트 스레드가 PPC 인터프리터로 실행 → `coreinit_start`(HLE)에서 out-of-bounds.
-  디버그 정보 빌드로 위치 확인 중.
+- **포인터 오버플로 UB (§4.3 주의점 1이 실제로 발생)**: `coreinit_FG.cpp`의 memset이 out-of-bounds. printf를 넣으면 사라지는
+  전형적인 최적화 문제였다. LLVM이 `memory_base + guest`가 넘치지 않는다고 가정한다. 해결: Emscripten에서 `memory_base`를
+  `GuestMemoryBase` 클래스로 바꿔 `operator+`가 정수 덧셈을 하게 함 (패치 0006). 90여 곳의 사용처는 그대로.
+- 디버깅 요령: `EXTRA_FLAGS=-g BUILD=build-wasm-dbg scripts/build-wasm.sh`로 DWARF 빌드 후 `emsymbolizer <wasm> <offset>`으로 줄 번호 확인.
+- **결과**: Node에서 `hello.rpx`가 끝까지 실행, 결정적 출력 5줄이 네이티브와 동일, `title exited with status 0`으로 정상 종료.
+- 속도(같은 머신, 인터프리터): 정수 루프 네이티브 128ms → wasm 420ms, 부동소수점 4.6s → 15.0s. 약 **3.3배 느림**.
+  gaemboy의 FastInterp(손실 25~33%)보다 손실이 크다. Cemu 인터프리터의 디스패치 구조 때문으로 보이며, 어차피 JIT(P5)이 필요하다.
 
 ### 참고 링크
 

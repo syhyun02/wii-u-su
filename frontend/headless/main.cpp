@@ -47,7 +47,8 @@ namespace
 		fflush(stdout);
 		fflush(stderr);
 #if defined(__EMSCRIPTEN__)
-		emscripten_force_exit(code); // also stops the worker threads
+		// end the whole process (all workers) without running static destructors, which would race with emulator threads
+		MAIN_THREAD_EM_ASM({ if (typeof process !== 'undefined') process.exit($0); }, code);
 #endif
 		_Exit(code);
 	}
